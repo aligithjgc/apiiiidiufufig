@@ -1,0 +1,133 @@
+# main.py
+import os
+import re
+import time
+import hmac
+import hashlib
+from typing import Dict, Any
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from instagram_info import Instagram_get_info
+
+# ---------- Configuration (from env vars) ----------
+API_KEY = os.getenv("API_KEY", "")  # ضع مفتاحك هنا كمتغيّر بيئي
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # requests per ip per minute
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # استخدم نطاقات إذا رغبت
+BOT_USER_AGENTS_BLOCKLIST = [
+    "curl", "python-requests", "wget", "bot", "spider", "crawler", "scrapy"
+]
+USERNAME_REGEX = re.compile(r'^[A-Za-z0-9._]{1,30}$')  # قيود اسم المستخدم في إنستجرام تقريباً
+SIGN_RESPONSE = os.getenv("SIGN_RESPONSE", "1") == "1"  # توقيع HMAC للردود (اختياري)
+HMAC_SECRET = os.getenv("HMAC_SECRET", API_KEY or "change_this_secret")
+
+# ---------- In-memory rate limiting (token-bucket per IP) ----------
+buckets: Dict[str, Dict[str, Any]] = {}
+# buckets[ip] = {"tokens": float, "last": timestamp}
+
+def _consume_token(ip: str) -> bool:
+    now = time.time()
+    bucket = buckets.get(ip)
+    rate_per_sec = RATE_LIMIT_PER_MIN / 60.0
+    capacity = RATE_LIMIT_PER_MIN
+    if not bucket:
+        buckets[ip] = {"tokens": capacity - 1.0, "last": now}
+        return True
+    elapsed = now - bucket["last"]
+    bucket["last"] = now
+    # refill
+    refill = elapsed * rate_per_sec
+    bucket["tokens"] = min(capacity, bucket["tokens"] + refill)
+    if bucket["tokens"] >= 1.0:
+        bucket["tokens"] -= 1.0
+        return True
+    return False
+
+# ---------- FastAPI app ----------
+app = FastAPI(title="Light Instagram Info API", version="1.0")
+
+# Pydantic model for response wrapper (for consistent output)
+class JSResponse(BaseModel):
+    success: bool
+    data: Dict[str, Any] = {}
+    error: str = None
+    telegram_dev: str = "@A8_jz"
+    dev_telegram_channel: str = "@A_8_A_9"
+    signature: str = None  # optional HMAC signature
+
+def _sign_payload(payload_bytes: bytes) -> str:
+    return hmac.new(HMAC_SECRET.encode(), payload_bytes, hashlib.sha256).hexdigest()
+
+# Middleware-like small function to check API key + bot UA + rate limit
+async def _authorize_and_rate_limit(request: Request, x_api_key: str = Header(None)):
+    ip = request.client.host if request.client else "unknown"
+    # 1) API key required
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: API_KEY missing")
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-KEY")
+
+    # 2) Basic user-agent bot check
+    ua = request.headers.get("user-agent", "").lower()
+    for bad in BOT_USER_AGENTS_BLOCKLIST:
+        if bad in ua:
+            raise HTTPException(status_code=403, detail="Forbidden: bot-like user-agent")
+
+    # 3) Rate limit per IP
+    allowed = _consume_token(ip)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+# Health route (no API key)
+@app.get("/health")
+async def health():
+    return {"status": "ok", "timestamp": int(time.time())}
+
+# Main endpoint: get user by username
+@app.get("/user/{username}")
+async def get_user(username: str, request: Request, x_api_key: str = Header(None)):
+    # Authorization & rate-limit + bot-check
+    await _authorize_and_rate_limit(request, x_api_key)
+
+    # Validate username
+    if not USERNAME_REGEX.match(username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+
+    # Call the provided instagram_info library (blocking)
+    try:
+        info = Instagram_get_info(username)  # expected to return dict or {}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="Upstream error when fetching Instagram data")
+
+    if not info:
+        res = JSResponse(success=False, data={}, error="User not found or private account")
+    else:
+        # Ensure telegram fields are included
+        info_with_meta = dict(info)
+        info_with_meta["telegram_dev"] = JSResponse.__fields__['telegram_dev'].default
+        info_with_meta["dev_telegram_channel"] = JSResponse.__fields__['dev_telegram_channel'].default
+        res = JSResponse(success=True, data=info_with_meta, error=None)
+
+    # Prepare JSON bytes and optional signature
+    body = res.dict()
+    import json
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    if SIGN_RESPONSE:
+        sig = _sign_payload(body_bytes)
+        body["signature"] = sig
+
+    # security headers
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none';",
+        "Access-Control-Allow-Origin": ALLOWED_ORIGINS
+    }
+
+    return JSONResponse(content=body, headers=headers)
+
+# Simple root
+@app.get("/")
+async def root():
+    return {"message": "Light Instagram Info API. See /user/{username} (requires X-API-KEY)"}
